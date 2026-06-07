@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>跨裝置雲端攝影機流星遊戲</title>
+    <!-- 引入 PeerJS 與 QRCode.js 外掛 -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <!-- 引入 MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <!-- 引入背景畫布樣式 -->
+    <style>
+      #bg-canvas {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        z-index: -1;
+      }
+    </style>
+
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        background: radial-gradient(ellipse at bottom, #1b2735 0%, #090a0f 70%, #000000 100%),
+                    linear-gradient(225deg, #2c003e 0%, #000000 100%);
+        background-blend-mode: screen;
+        color: white;
+        font-family: sans-serif;
+        font-weight: bold;
+        overflow: hidden;
+      }
+      #status {
+        position: absolute;
+        top: 10px;
+        font-size: 1.2rem;
+        color: #b388ff; /* 藍紫色 */
+        z-index: 10;
+        background: rgba(0,0,0,0.5);
+        padding: 5px 15px;
+        border-radius: 20px;
+      }
+      #setup-area {
+        text-align: center;
+      }
+      #qrcode-container {
+        display: inline-block;
+        background: white;
+        padding: 10px;
+        line-height: 0;
+        border-radius: 10px;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+      }
+      .video-container {
+        position: relative;
+        width: 800px;
+        height: 600px;
+        display: none;
+        background: #000;
+        border: 4px solid #444;
+        border-radius: 15px;
+        overflow: hidden;
+      }
+      video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        transform: scaleX(-1); /* 修正左右相反的問題（鏡像） */
+      }
+      #game-canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        transform: scaleX(-1); /* Canvas 也需要鏡像以對齊手勢 */
+      }
+      p { text-align: center; max-width: 80%; }
+    </style>
+  </head>
+  <body>
+    <canvas id="bg-canvas"></canvas>
+    <div id="status">初始化連線中...</div>
+
+    <div id="setup-area">
+      <div id="qrcode-container"></div>
+      <p style="color: #b388ff;">請用手機掃描上方 QR Code 作為攝影機</p>
+    </div>
+
+    <div id="video-container" class="video-container">
+      <video id="remote-video" autoplay playsinline muted></video>
+      <canvas id="game-canvas"></canvas>
+    </div>
+
+    <script>
+      const statusEl = document.getElementById('status');
+      const setupArea = document.getElementById('setup-area');
+      const videoContainer = document.getElementById('video-container');
+      const videoEl = document.getElementById('remote-video');
+      const canvasEl = document.getElementById('game-canvas');
+      const ctx = canvasEl.getContext('2d');
+      
+      // 背景畫布
+      const bgCanvas = document.getElementById('bg-canvas');
+      const bgCtx = bgCanvas.getContext('2d');
+
+      // 遊戲變數
+      let gameState = 'IDLE'; // IDLE, PLAYING, GAMEOVER
+      let score = 0;
+      let timeLeft = 30;
+      let meteors = [];
+      let bgMeteors = []; // 背景裝飾流星
+      let gameTimer = null;
+      let showRestartPrompt = false;
+      let lastHandPos = { x: 0, y: 0 };
+
+      // 初始化背景畫布大小
+      function resizeBg() {
+        bgCanvas.width = window.innerWidth;
+        bgCanvas.height = window.innerHeight;
+      }
+      window.addEventListener('resize', resizeBg);
+      resizeBg();
+
+      // 檢查網址是否有參數 (被掃描後會帶有 ?join=ID)
+      const urlParams = new URLSearchParams(window.location.search);
+      const joinId = urlParams.get('join');
+
+      const peer = new Peer();
+
+      // 初始化 MediaPipe Hands
+      const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+      });
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.7
+      });
+      hands.onResults(onHandResults);
+
+      // 設定 Canvas 大小
+      canvasEl.width = 800;
+      canvasEl.height = 600;
+
+      peer.on('open', (id) => {
+        if (!joinId) {
+          statusEl.innerText = "等待攝影機加入...";
+          const hostUrl = `${window.location.origin}${window.location.pathname}?join=${id}`;
+          new QRCode(document.getElementById("qrcode-container"), {
+            text: hostUrl,
+            width: 200,
+            height: 200
+          });
+        } else {
+          statusEl.innerText = "手機攝影機啟動中...";
+          setupArea.style.display = 'none';
+          startCamera(joinId);
+        }
+      });
+
+      peer.on('call', (call) => {
+        console.log("收到攝影機連線請求...");
+        call.answer();
+        call.on('stream', (stream) => {
+          showVideoStream(stream);
+          statusEl.innerText = "攝影機已連線 - 👍 比讚開始遊戲";
+        });
+      });
+
+      peer.on('error', (err) => {
+        console.error("PeerJS 錯誤:", err);
+        statusEl.innerText = "連線失敗: " + err.type;
+      });
+
+      async function startCamera(targetId) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              facingMode: "user",
+              width: { ideal: 800 },
+              height: { ideal: 600 }
+            }, 
+            audio: false 
+          });
+          
+          showVideoStream(stream);
+          peer.call(targetId, stream);
+        } catch (err) {
+          statusEl.innerText = "相機開啟失敗: " + err.message;
+        }
+      }
+
+      function showVideoStream(stream) {
+        setupArea.style.display = 'none';
+        videoContainer.style.display = 'block';
+        videoEl.srcObject = stream;
+        videoEl.play().catch(e => console.error("影片播放失敗:", e));
+        
+        if (!joinId) {
+          // 電腦端：啟動手勢偵測與遊戲邏輯
+          processVideo();
+        } else {
+          // 手機端：隱藏遊戲畫布與背景，僅作為攝影機使用
+          canvasEl.style.display = 'none';
+          bgCanvas.style.display = 'none';
+          statusEl.innerText = "攝影機模式：影像已同步，請看電腦螢幕";
+        }
+      }
+
+      async function processVideo() {
+        if (videoEl.readyState >= 2) {
+          await hands.send({image: videoEl});
+        }
+        requestAnimationFrame(processVideo);
+      }
+
+      function onHandResults(results) {
+        ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+        let handDetected = results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
+        
+        if (handDetected) {
+          const landmarks = results.multiHandLandmarks[0];
+          lastHandPos = { x: landmarks[9].x * canvasEl.width, y: landmarks[9].y * canvasEl.height };
+          
+          if (isThumbsUp(landmarks)) {
+            if (gameState === 'IDLE' || (gameState === 'GAMEOVER' && showRestartPrompt)) {
+              startGame();
+            }
+          }
+
+          if (gameState === 'PLAYING') {
+            checkCollision(lastHandPos);
+          }
+        }
+        updateGameLogic();
+        drawGame();
+      }
+
+      function isThumbsUp(landmarks) {
+        const thumbTip = landmarks[4].y;
+        const thumbBase = landmarks[2].y;
+        const indexTip = landmarks[8].y;
+        const indexBase = landmarks[5].y;
+        return thumbTip < thumbBase && indexTip > indexBase;
+      }
+
+      function startGame() {
+        gameState = 'PLAYING';
+        score = 0;
+        timeLeft = 30;
+        meteors = [];
+        showRestartPrompt = false;
+        statusEl.innerText = "遊戲開始！";
+
+        if (gameTimer) clearInterval(gameTimer);
+        gameTimer = setInterval(() => {
+          timeLeft--;
+          if (timeLeft <= 0) endGame();
+        }, 1000);
+      }
+
+      function endGame() {
+        gameState = 'GAMEOVER';
+        clearInterval(gameTimer);
+        statusEl.innerText = "遊戲結束";
+        setTimeout(() => {
+          showRestartPrompt = true;
+        }, 3000);
+      }
+
+      function updateGameLogic() {
+        // 全螢幕背景裝飾流星雨邏輯
+        if (Math.random() < 0.2) { 
+          bgMeteors.push({
+            x: Math.random() * bgCanvas.width * 1.5,
+            y: -50,
+            speed: Math.random() * 8 + 5,
+            length: Math.random() * 120 + 60
+          });
+        }
+        bgMeteors.forEach((m, index) => {
+          m.x -= m.speed;
+          m.y += m.speed;
+          if (m.y > bgCanvas.height + 100 || m.x < -100) {
+            bgMeteors.splice(index, 1);
+          }
+        });
+
+        if (gameState !== 'PLAYING') return;
+        // 遊戲流星生成
+        if (Math.random() < 0.12) {
+          meteors.push({
+            x: Math.random() * (canvasEl.width * 0.5) + (canvasEl.width * 0.5),
+            y: -50,
+            speed: Math.random() * 5 + 3,
+            size: Math.random() * 20 + 20
+          });
+        }
+        meteors.forEach((m, index) => {
+          m.x -= m.speed;
+          m.y += m.speed;
+          if (m.y > canvasEl.height + 50 || m.x < -50) {
+            meteors.splice(index, 1);
+          }
+        });
+      }
+
+      function checkCollision(hand) {
+        meteors.forEach((m, index) => {
+          const dist = Math.hypot(hand.x - m.x, hand.y - m.y);
+          if (dist < m.size + 30) {
+            meteors.splice(index, 1);
+            score += 10;
+          }
+        });
+      }
+
+      function drawGame() {
+        // 1. 繪製全螢幕背景流星 (銀色雨滴)
+        bgCtx.clearRect(0, 0, bgCanvas.width, bgCanvas.height);
+        bgMeteors.forEach(m => {
+          bgCtx.beginPath();
+          bgCtx.moveTo(m.x, m.y);
+          bgCtx.lineTo(m.x + m.length, m.y - m.length);
+          bgCtx.strokeStyle = "rgba(192, 192, 192, 0.5)"; // 銀色線條
+          bgCtx.lineWidth = 2;
+          bgCtx.stroke();
+        });
+
+        // 2. 繪製遊戲畫布
+        ctx.save();
+        ctx.scale(-1, 1);
+        ctx.translate(-canvasEl.width, 0);
+
+        if (gameState === 'IDLE') {
+          if (!joinId) {
+            drawCenteredText("👍 比讚開始遊戲", "45px Arial", "#b388ff", canvasEl.height / 2 - 20);
+            drawCenteredText("用手抓住流星獲得分數", "28px Arial", "#b388ff", canvasEl.height / 2 + 50);
+          }
+        } 
+        else if (gameState === 'PLAYING') {
+          ctx.restore(); // 暫時恢復座標系以繪製跟隨手的流星
+          
+          // 繪製遊戲中的流星與彗星尾巴
+          meteors.forEach(m => {
+            // 繪製彗星尾巴 (不參與碰撞判定)
+            ctx.beginPath();
+            const grad = ctx.createLinearGradient(m.x, m.y, m.x + m.speed * 10, m.y - m.speed * 10);
+            grad.addColorStop(0, "rgba(255, 204, 0, 0.8)");
+            grad.addColorStop(1, "transparent");
+            ctx.strokeStyle = grad;
+            ctx.lineWidth = m.size * 0.8;
+            ctx.lineCap = "round";
+            ctx.moveTo(m.x, m.y);
+            ctx.lineTo(m.x + m.speed * 10, m.y - m.speed * 10);
+            ctx.stroke();
+
+            // 繪製流星本體 (玩家抓取目標)
+            ctx.beginPath();
+            ctx.arc(m.x, m.y, m.size, 0, Math.PI * 2);
+            ctx.fillStyle = "#ffcc00";
+            ctx.shadowBlur = 15;
+            ctx.shadowColor = "#ff3300";
+            ctx.fill();
+            ctx.closePath();
+          });
+          ctx.save();
+          ctx.scale(-1, 1);
+          ctx.translate(-canvasEl.width, 0);
+          
+          // 僅在電腦端顯示分數與時間
+          if (!joinId) {
+            ctx.fillStyle = "#b388ff";
+            ctx.font = "bold 32px Arial";
+            ctx.fillText(`分數: ${score}`, 30, 50);
+            ctx.fillText(`時間: ${timeLeft}s`, 30, 90);
+          }
+        } 
+        else if (gameState === 'GAMEOVER') {
+          if (!joinId) {
+            drawCenteredText("最終分數", "32px Arial", "#b388ff", canvasEl.height / 2 - 40);
+            drawCenteredText(score.toString(), "90px Arial", "#00f2ff", canvasEl.height / 2 + 40);
+            
+            if (showRestartPrompt) {
+              drawCenteredText("👍 比讚繼續挑戰", "32px Arial", "#b388ff", canvasEl.height / 2 + 120);
+            }
+          }
+        }
+        ctx.restore();
+      }
+
+      function drawCenteredText(text, font, color, y) {
+        ctx.font = font;
+        ctx.fillStyle = color;
+        ctx.textAlign = "center";
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = "rgba(0,0,0,0.8)";
+        ctx.fillText(text, canvasEl.width / 2, y);
+      }
+    </script>
+  </body>
+</html>
